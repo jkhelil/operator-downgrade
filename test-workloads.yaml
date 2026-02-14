@@ -1,0 +1,84 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: test-pipelines
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: test-task
+  namespace: test-pipelines
+spec:
+  steps:
+    - name: echo
+      image: registry.access.redhat.com/ubi8/ubi-minimal:latest
+      script: |
+        #!/bin/sh
+        echo "Hello from test task"
+        echo "This workload should survive the downgrade"
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: test-pipeline
+  namespace: test-pipelines
+spec:
+  tasks:
+    - name: hello
+      taskSpec:
+        steps:
+          - name: echo
+            image: registry.access.redhat.com/ubi8/ubi-minimal:latest
+            script: |
+              #!/bin/sh
+              echo "Hello from test pipeline"
+---
+apiVersion: tekton.dev/v1
+kind: TaskRun
+metadata:
+  name: test-taskrun-1
+  namespace: test-pipelines
+spec:
+  taskRef:
+    name: test-task
+---
+apiVersion: tekton.dev/v1
+kind: TaskRun
+metadata:
+  name: test-taskrun-2
+  namespace: test-pipelines
+spec:
+  taskSpec:
+    steps:
+      - name: echo
+        image: registry.access.redhat.com/ubi8/ubi-minimal:latest
+        script: |
+          #!/bin/sh
+          echo "Inline task - should be preserved"
+---
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: test-pipelinerun-1
+  namespace: test-pipelines
+spec:
+  pipelineRef:
+    name: test-pipeline
+---
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: test-pipelinerun-2
+  namespace: test-pipelines
+spec:
+  pipelineSpec:
+    tasks:
+      - name: inline-task
+        taskSpec:
+          steps:
+            - name: echo
+              image: registry.access.redhat.com/ubi8/ubi-minimal:latest
+              script: |
+                #!/bin/sh
+                echo "Inline pipeline - should be preserved"
