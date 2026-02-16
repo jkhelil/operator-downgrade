@@ -62,6 +62,21 @@ fi
 echo "  ✅ Verified as 1.15.x"
 echo ""
 
+# Check if pipelines-1.14 channel is available
+echo "Checking if pipelines-1.14 channel is available..."
+CHANNEL_CHECK=$(oc get packagemanifest openshift-pipelines-operator-rh -n openshift-marketplace -o json 2>/dev/null | jq -r '.status.channels[] | select(.name=="pipelines-1.14") | .name')
+
+if [[ "$CHANNEL_CHECK" != "pipelines-1.14" ]]; then
+  echo "❌ ERROR: pipelines-1.14 channel not found in catalog"
+  echo "Available channels:"
+  oc get packagemanifest openshift-pipelines-operator-rh -n openshift-marketplace -o jsonpath='{.status.channels[*].name}'
+  echo ""
+  echo "Cannot proceed with downgrade - target channel unavailable"
+  exit 1
+fi
+echo "  ✅ pipelines-1.14 channel is available"
+echo ""
+
 # Backup TektonConfig
 echo "Backing up TektonConfig..."
 mkdir -p "$BACKUP_DIR"
@@ -177,6 +192,25 @@ for i in {1..60}; do
 done
 echo ""
 
+# Wait for CA bundle propagation in MutatingWebhookConfiguration
+echo "Waiting for CA bundle to be injected into webhook configuration..."
+for i in {1..30}; do
+  CABUNDLE_SIZE=$(oc get mutatingwebhookconfigurations.admissionregistration.k8s.io webhook.operator.tekton.dev -o jsonpath='{.webhooks[0].clientConfig.caBundle}' 2>/dev/null | wc -c | tr -d ' ')
+  if [[ "$CABUNDLE_SIZE" -gt 100 ]]; then
+    echo "  ✅ CA bundle populated ($CABUNDLE_SIZE bytes)"
+    echo "  ⏳ Waiting 20s for webhook certificate to propagate and be loaded by pod..."
+    sleep 20
+    break
+  fi
+  if [[ $i -eq 1 ]]; then
+    echo "  ⏳ CA bundle size: $CABUNDLE_SIZE bytes (waiting for service-ca-operator...)"
+  elif [[ $((i % 5)) -eq 0 ]]; then
+    echo "  ⏳ Still waiting... ($i/30, CA bundle: $CABUNDLE_SIZE bytes)"
+  fi
+  sleep 2
+done
+echo ""
+
 # ============================================
 # PHASE 3: Fix Invalid Parameters
 # ============================================
@@ -189,10 +223,24 @@ if oc get tektonconfig config -o yaml 2>/dev/null | grep -q "resolverTasks"; the
   echo "Found resolverTasks parameter (invalid for 1.14.x) - removing..."
   echo ""
   
-  # Retry patching with smart error detection
+  # Retry patching with timeout (120 seconds)
   PATCH_SUCCESS=false
-  for attempt in {1..10}; do
-    echo "Attempt $attempt: Patching TektonConfig..."
+  MAX_WAIT_TIME=120
+  START_TIME=$(date +%s)
+  ATTEMPT=0
+  
+  while true; do
+    ATTEMPT=$((ATTEMPT + 1))
+    CURRENT_TIME=$(date +%s)
+    ELAPSED=$((CURRENT_TIME - START_TIME))
+    
+    # Check timeout
+    if [[ $ELAPSED -ge $MAX_WAIT_TIME ]]; then
+      echo "  ⏱️  Timeout reached (${MAX_WAIT_TIME}s), stopping retries"
+      break
+    fi
+    
+    echo "Attempt $ATTEMPT: Patching TektonConfig... (${ELAPSED}s elapsed)"
     
     # Temporarily disable exit on error for patch command
     set +e
@@ -201,25 +249,35 @@ if oc get tektonconfig config -o yaml 2>/dev/null | grep -q "resolverTasks"; the
     set -e
     
     if [[ $PATCH_RC -eq 0 ]]; then
-      echo "  ✅ Removed resolverTasks from TektonConfig"
+      echo "  ✅ Removed resolverTasks from TektonConfig (after ${ELAPSED}s)"
       PATCH_SUCCESS=true
       break
-    elif echo "$PATCH_OUTPUT" | grep -q "tls: unrecognized name"; then
-      echo "  ⏳ Webhook TLS certificates not ready yet, waiting..."
-      sleep 10
-    elif echo "$PATCH_OUTPUT" | grep -q "not found"; then
-      echo "  ⏳ Webhook service not ready yet, waiting..."
-      sleep 5
     else
-      echo "  ❌ Unexpected error: $PATCH_OUTPUT"
-      break
+      # Retry on ANY error - let timeout handle it
+      echo "  ⏳ Patch failed, retrying in 5s..."
+      if [[ $ATTEMPT -eq 1 ]] || [[ $((ATTEMPT % 3)) -eq 0 ]]; then
+        # Show error every 3rd attempt to avoid spam
+        echo "     Error: $PATCH_OUTPUT"
+      fi
+      sleep 5
     fi
   done
   
   if [[ "$PATCH_SUCCESS" != "true" ]]; then
-    echo "  ⚠️  Warning: Failed to patch TektonConfig"
-    echo "  Please manually run:"
-    echo "  oc patch tektonconfig config --type='merge' -p '{\"spec\":{\"addon\":{\"params\":[{\"name\":\"communityClusterTasks\",\"value\":\"true\"},{\"name\":\"clusterTasks\",\"value\":\"true\"},{\"name\":\"pipelineTemplates\",\"value\":\"true\"}]}}}'"
+    echo ""
+    echo "  ⚠️  Warning: Failed to patch TektonConfig after ${MAX_WAIT_TIME}s"
+    echo "  Last error: $PATCH_OUTPUT"
+    echo ""
+    echo "  To retry manually:"
+    echo "  1. Wait 30-60 seconds for webhook CA bundle propagation"
+    echo "  2. Run the patch command:"
+    echo "     oc patch tektonconfig config --type='merge' -p '{\"spec\":{\"addon\":{\"params\":[{\"name\":\"communityClusterTasks\",\"value\":\"true\"},{\"name\":\"clusterTasks\",\"value\":\"true\"},{\"name\":\"pipelineTemplates\",\"value\":\"true\"}]}}}'"
+    echo "  3. After successful patch, verify TektonConfig becomes Ready (wait ~1 minute):"
+    echo "     oc get tektonconfig config -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}'"
+    echo ""
+    echo "  To check webhook status:"
+    echo "  oc get pods -n openshift-operators -l name=tekton-operator-webhook"
+    echo "  oc get validatingwebhookconfigurations.admissionregistration.k8s.io webhook.operator.tekton.dev -o yaml | grep caBundle"
   fi
   echo ""
 else
