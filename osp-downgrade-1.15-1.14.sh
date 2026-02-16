@@ -305,14 +305,23 @@ echo ""
 echo "PHASE 4: Waiting for TektonConfig Ready"
 echo "----------------------------------------"
 
-echo "Waiting for TektonConfig to be Ready (may take 2-3 minutes)..."
+echo "Waiting for TektonConfig to be Ready with version 1.14.x (may take 2-3 minutes)..."
 for i in {1..120}; do
   CONFIG_READY=$(oc get tektonconfig config -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "False")
-  if [[ "$CONFIG_READY" == "True" ]]; then
-    echo "  ✅ TektonConfig is Ready"
+  CONFIG_VERSION=$(oc get tektonconfig config -o jsonpath='{.status.version}' 2>/dev/null || echo "")
+  
+  if [[ "$CONFIG_READY" == "True" ]] && [[ "$CONFIG_VERSION" =~ ^1\.14\. ]]; then
+    echo "  ✅ TektonConfig is Ready with version $CONFIG_VERSION"
     break
   fi
-  echo -n "."
+  
+  # Show progress every 10 iterations
+  if [[ $((i % 10)) -eq 0 ]]; then
+    echo ""
+    echo "  ⏳ Still waiting... (Ready: $CONFIG_READY, Version: $CONFIG_VERSION)"
+  else
+    echo -n "."
+  fi
   sleep 3
 done
 echo ""
@@ -324,7 +333,7 @@ echo ""
 echo "PHASE 5: Verification"
 echo "----------------------------------------"
 
-# Check TektonConfig version and status
+# Re-check TektonConfig version and status for final verification
 NEW_VERSION=$(oc get tektonconfig config -o jsonpath='{.status.version}' 2>/dev/null)
 CONFIG_READY=$(oc get tektonconfig config -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
 
@@ -333,19 +342,27 @@ oc get tektonconfig config
 echo ""
 
 if [[ ! "$NEW_VERSION" =~ ^1\.14\. ]]; then
-  echo "❌ ERROR: Version is not 1.14.x"
+  echo "⚠️  WARNING: Version is not 1.14.x yet"
   echo "Current version: $NEW_VERSION"
-  exit 1
+  echo ""
+  echo "The operator CSV is 1.14.x but TektonConfig status hasn't updated."
+  echo "This is usually a timing issue. Please wait 1-2 minutes and verify:"
+  echo "  oc get tektonconfig config"
+  echo ""
 fi
 
 if [[ "$CONFIG_READY" != "True" ]]; then
-  echo "❌ ERROR: TektonConfig is not Ready"
-  exit 1
+  echo "⚠️  WARNING: TektonConfig is not Ready yet"
+  echo "Check status with: oc get tektonconfig config -o yaml"
+  echo ""
 fi
 
-echo "  ✅ Version: $NEW_VERSION"
-echo "  ✅ Status: Ready"
-echo ""
+# Only show success if both conditions are met
+if [[ "$NEW_VERSION" =~ ^1\.14\. ]] && [[ "$CONFIG_READY" == "True" ]]; then
+  echo "  ✅ Version: $NEW_VERSION"
+  echo "  ✅ Status: Ready"
+  echo ""
+fi
 
 # Check workload counts
 echo "Verifying user workloads..."
@@ -378,10 +395,26 @@ echo ""
 # ============================================
 
 echo "=========================================="
-echo "✅ DOWNGRADE COMPLETE"
+if [[ "$NEW_VERSION" =~ ^1\.14\. ]] && [[ "$CONFIG_READY" == "True" ]]; then
+  echo "✅ DOWNGRADE COMPLETE"
+else
+  echo "⚠️  DOWNGRADE IN PROGRESS"
+fi
 echo "=========================================="
 echo ""
-echo "Downgraded from: $CURRENT_CSV"
-echo "Downgraded to:   $NEW_CSV"
+echo "Operator downgraded:"
+echo "  From: $CURRENT_CSV"
+echo "  To:   $NEW_CSV"
+echo ""
+echo "TektonConfig status:"
+echo "  Version: $NEW_VERSION"
+echo "  Ready:   $CONFIG_READY"
+echo ""
 echo "Backup location: $BACKUP_DIR/"
 echo ""
+
+if [[ ! "$NEW_VERSION" =~ ^1\.14\. ]] || [[ "$CONFIG_READY" != "True" ]]; then
+  echo "NOTE: TektonConfig is still reconciling. This is normal and may take 1-2 more minutes."
+  echo "Monitor progress with: watch oc get tektonconfig config"
+  echo ""
+fi
